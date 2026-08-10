@@ -10,6 +10,8 @@ V2.4.0: 去掉 DPAPI/base64 加密，明文存储。靠 OS 层全盘加密保护
   log_message("Assistant：明天有雨，记得带伞")
 """
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -17,6 +19,14 @@ import time as _time
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# ── P0-1 落沙幂等去重（沙漏侧，2026-08-10）──
+# 双写根因在编辑器侧（momo_handler 先 _sandglass_log 再 inject_via_websocket
+# 内部又落沙一次；且 _sandglass_log 在 inject 锁检查之前执行，前端双 POST 也会双写）。
+# 按硬约束不改编辑器，在沙漏写入口做幂等去重：同一 sender+text 在时间窗内只写一次。
+# 去重状态存文件（每次落沙是独立 Popen 进程，内存态跨进程无效）。
+_DEDUP_WINDOW = float(os.environ.get("SANDGLASS_DEDUP_WINDOW", "10"))  # 秒，可配
+_DEDUP_MAX = 500
 
 # ── AI无意义回复过滤器（V2.1.10修复：长度判断替代^锚定）──
 _AI_TRIVIAL = re.compile(
@@ -47,6 +57,42 @@ def _estimate_info_value(text: str) -> float:
 from sandglass_paths import _NB
 
 _SANDGLASS = os.path.join(_NB, "sandglass.txt")
+# P0-1：去重状态文件放沙漏数据目录（_NB 由环境变量/相对推导，不硬编码绝对路径）
+_DEDUP_FILE = os.path.join(_NB, ".sandglass_dedup.json")
+
+
+def _dedup_check_and_mark(sender: str, text: str) -> bool:
+    """幂等去重：同一 (sender, text) 在时间窗内已写过 → 返回 True（应跳过写入）。
+
+    - 状态持久化到 _DEDUP_FILE（JSON: {hash: ts}），跨进程生效
+    - 过期条目惰性清理；fail-open：任何异常不阻塞写入（返回 False=不重复）
+    """
+    try:
+        key = hashlib.md5(f"{sender}\x00{text}".encode("utf-8")).hexdigest()
+        now = _time.time()
+        recent = {}
+        if os.path.exists(_DEDUP_FILE):
+            try:
+                with open(_DEDUP_FILE, "r", encoding="utf-8") as f:
+                    recent = json.load(f)
+            except Exception:
+                recent = {}
+        # 惰性清理过期条目
+        recent = {k: t for k, t in recent.items() if now - t < _DEDUP_WINDOW}
+        if key in recent:
+            return True
+        recent[key] = now
+        # 防无限膨胀：只保留最近 _DEDUP_MAX 条
+        if len(recent) > _DEDUP_MAX:
+            recent = dict(sorted(recent.items(), key=lambda kv: -kv[1])[:_DEDUP_MAX])
+        tmp = _DEDUP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(recent, f)
+        os.replace(tmp, _DEDUP_FILE)
+        return False
+    except Exception as e:
+        logger.warning(f"落沙去重状态读写失败（fail-open 不阻塞写入）: {e}")
+        return False
 
 
 def log_message(text: str, sender: str = "agent") -> bool:
@@ -80,6 +126,9 @@ def log_message(text: str, sender: str = "agent") -> bool:
             logger.error(f"落沙锁 3 次重试均超时（15s），强制写入（可能并发冲突）")
 
         try:
+            # P0-1：锁内幂等去重（同一 sender+text 时间窗内只写一次）
+            if _dedup_check_and_mark(sender, text):
+                return True
             with open(_SANDGLASS, "a", encoding="utf-8") as f:
                 f.write(line)
         finally:
