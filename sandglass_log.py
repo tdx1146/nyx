@@ -16,7 +16,9 @@ import logging
 import os
 import re
 import time as _time
+import uuid
 from datetime import datetime
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,109 @@ except Exception:
 # 沙漏侧本身不再设 500 截断：SANDGLASS_MAX_TEXT_LEN 可配（默认 0=不截断，
 # 完整保留；编辑器若放开 500 限制，沙漏将全量保存）。
 _MAX_TEXT_LEN = int(os.environ.get("SANDGLASS_MAX_TEXT_LEN", "0") or "0")
+
+
+# ── P0-3 落沙 → 总线 sandglass.entry（2026-08-10，方向1接通：沙漏流水→LMS 塑形素材）──
+# 落沙成功后追加发布 v1.1 契约事件，iso-sand LmsFeedHandler 订阅后喂 LMS /feed。
+# 防循环三重闸：
+#   1) 只发 user/agent 真实对话（内部 system/fact_store/memory_write 等不喂，避免脏料回灌）
+#   2) 来源标记 payload.source="sandglass"，消费端可识别不再回灌
+#   3) SANDGLASS_BUS_MIN_INTERVAL 节流（默认 2s/条，跨进程状态文件）+ 总线端去重（P0-1）
+_BUS_FILE: Optional[str] = None          # 惰性解析缓存
+_BUS_MIN_INTERVAL = float(os.environ.get("SANDGLASS_BUS_MIN_INTERVAL", "2"))
+_BUS_STATE_FILE = os.path.join(_NB, ".sandglass_bus_state.json")
+
+
+def _resolve_bus_file() -> Optional[str]:
+    """解析事件总线文件路径（不硬编码：SANDGLASS_BUS_FILE → ISO_SAND_HOME
+    → AGENT_OS_HOME → 从沙漏数据目录向上相对推导 Agent OS/iso-sand）。"""
+    global _BUS_FILE
+    if _BUS_FILE:
+        return _BUS_FILE
+    cand = os.environ.get("SANDGLASS_BUS_FILE")
+    if cand:
+        _BUS_FILE = cand
+        return _BUS_FILE
+    iso = os.environ.get("ISO_SAND_HOME")
+    if iso:
+        cand = os.path.join(iso, "data", "event_bus.jsonl")
+        if os.path.isdir(os.path.dirname(cand)):
+            _BUS_FILE = cand
+            return _BUS_FILE
+    ago = os.environ.get("AGENT_OS_HOME")
+    if ago:
+        cand = os.path.join(ago, "iso-sand", "data", "event_bus.jsonl")
+        if os.path.isdir(os.path.dirname(cand)):
+            _BUS_FILE = cand
+            return _BUS_FILE
+    # 相对推导：从 _NB 向上最多 6 层找 Agent OS/iso-sand/data/event_bus.jsonl
+    d = os.path.abspath(_NB)
+    for _ in range(6):
+        cand = os.path.join(d, "Agent OS", "iso-sand", "data", "event_bus.jsonl")
+        if os.path.isfile(cand):
+            _BUS_FILE = cand
+            return _BUS_FILE
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _publish_sandglass_entry(text: str, sender: str) -> None:
+    """落沙成功后发布 sandglass.entry 总线事件（fail-open，绝不阻塞落沙）。
+
+    事件字段对齐 v1.1 契约（与 doubt_adapter._publish_doubt_event 同构）：
+    schema_version/event_id/trace_id/t/event_type/producer/result/detail/payload。
+    """
+    try:
+        bus = _resolve_bus_file()
+        if not bus:
+            return
+        # 节流：同 sender 最小间隔（跨进程状态文件，防风暴）
+        now = _time.time()
+        try:
+            with open(_BUS_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+        if now - float(state.get(sender, 0.0)) < _BUS_MIN_INTERVAL:
+            return
+        state[sender] = now
+        try:
+            tmp = _BUS_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            os.replace(tmp, _BUS_STATE_FILE)
+        except Exception:
+            pass
+
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        event = {
+            "schema_version": "1.1",
+            "event_id": str(uuid.uuid4()),
+            "trace_id": f"sandglass:{int(now)}",
+            "t": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "event_type": "sandglass.entry",
+            "producer": "sandglass",
+            "result": "OK",
+            "detail": f"落沙: sender={sender} len={len(text)}",
+            "payload": {
+                "text": text,
+                "sender": sender,
+                "ts": ts_str,
+                "source": "sandglass",
+            },
+        }
+        import fcntl
+        with open(bus, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        logger.warning(f"落沙总线事件发布失败（fail-open）: {e}")
 
 
 def _normalize_sender(sender: str) -> str:
@@ -187,6 +292,14 @@ def log_message(text: str, sender: str = "agent") -> bool:
             try:
                 from weavethread import wthread_store
                 wthread_store(text, line_num=0)
+            except Exception:
+                pass
+
+        # P0-3：落沙成功 → 发布 sandglass.entry 总线事件
+        # （方向1：沙漏流水 → LmsFeedHandler → LMS /feed 塑形；只发真实对话）
+        if sender in ("user", "agent"):
+            try:
+                _publish_sandglass_entry(text, sender)
             except Exception:
                 pass
 
