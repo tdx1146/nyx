@@ -60,6 +60,33 @@ _SANDGLASS = os.path.join(_NB, "sandglass.txt")
 # P0-1：去重状态文件放沙漏数据目录（_NB 由环境变量/相对推导，不硬编码绝对路径）
 _DEDUP_FILE = os.path.join(_NB, ".sandglass_dedup.json")
 
+# ── P0-2 sender 归一化（2026-08-10）──
+# 双写/错标根因在编辑器侧：awake/momo 面板（现为主发送通道）一律 bypass_lock=True
+# → edit-web.py:209 标 'sister'；且 momo_handler:40 硬编码 'sister'。
+# 按硬约束不改编辑器，在沙漏写入口归一化：'sister'（主会话对话）→ 'user'，
+# 救活 weavethread（仅 sender=='user' 提取三元组，L3 织线自 8/1 停摆）。
+# 可用 SANDGLASS_SENDER_MAP 覆盖（JSON dict，如 '{"sister":"user","agent":"assistant"}'）。
+_SENDER_MAP = {}
+_SENDER_MAP_RAW = os.environ.get("SANDGLASS_SENDER_MAP", '{"sister": "user"}')
+try:
+    import json as _json
+    _SENDER_MAP = _json.loads(_SENDER_MAP_RAW)
+    if not isinstance(_SENDER_MAP, dict):
+        _SENDER_MAP = {}
+except Exception:
+    _SENDER_MAP = {}
+
+# ── P0-2 落沙长度（2026-08-10）──
+# 编辑器侧 edit-web.py:302 的 content[:500] 属编辑器代码，按硬约束不改；
+# 沙漏侧本身不再设 500 截断：SANDGLASS_MAX_TEXT_LEN 可配（默认 0=不截断，
+# 完整保留；编辑器若放开 500 限制，沙漏将全量保存）。
+_MAX_TEXT_LEN = int(os.environ.get("SANDGLASS_MAX_TEXT_LEN", "0") or "0")
+
+
+def _normalize_sender(sender: str) -> str:
+    """P0-2：sender 归一化（主会话对话不再错标 sister）。"""
+    return _SENDER_MAP.get(sender, sender)
+
 
 def _dedup_check_and_mark(sender: str, text: str) -> bool:
     """幂等去重：同一 (sender, text) 在时间窗内已写过 → 返回 True（应跳过写入）。
@@ -100,6 +127,12 @@ def log_message(text: str, sender: str = "agent") -> bool:
     返回 True 表示写入成功。
     V2.4.0: 去掉DPAPI，落沙提速~2ms，FTS5可直接索引中文。"""
     try:
+        # P0-2：sender 归一化（编辑器 bypass 路径错标 sister → user）
+        sender = _normalize_sender(sender)
+        # P0-2：落沙长度可配（默认 0=不截断，完整保留）
+        if _MAX_TEXT_LEN > 0 and len(text) > _MAX_TEXT_LEN:
+            text = text[:_MAX_TEXT_LEN]
+
         # AI低价值回复过滤（V2.1）
         if sender == "agent" and _estimate_info_value(text) < 0.3:
             return False
