@@ -70,6 +70,20 @@ def _maybe_commit():
         _commit_pending = 0
 
 
+def _commit_now():
+    """立即提交（P0-2 织线修复）：shadow_sand 的共享连接持有未提交写事务时，
+    同一进程后续的 weavethread 独立连接会撞 'database is locked'（被 log_message
+    的 except 静默吞掉 → wthread_triples 自 8/1 停摆）。落沙链路每步后立即提交，
+    释放写锁，让织线恢复提取。"""
+    global _commit_pending
+    if _conn is not None:
+        try:
+            _conn.commit()
+        except Exception:
+            pass
+    _commit_pending = 0
+
+
 # ═══════════════════ 查询（脱口而出层） ═══════════════════
 
 def shadow_search(query: str, limit: int = 10) -> list:
@@ -176,6 +190,7 @@ def shadow_index(text: str, category: str = "general", tags: str = "", line_num:
         )
 
     _maybe_commit()
+    _commit_now()  # P0-2：立即提交，释放写锁（否则同一进程后续 weavethread 撞 database is locked）
 
 
 # ═══════════════════ 反馈 ═══════════════════
