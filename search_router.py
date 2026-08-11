@@ -23,6 +23,13 @@ def _detect_lang(text: str) -> str:
 
 
 def simhash_rerank(candidates, query) -> list:
+    """SimHash 按汉明距离重排。
+    失忆根因-3：短查询（≤6 字符）跳过重排——simhash 对短查询的指纹
+    与长文本指纹距离无区分度，会把精确命中（如 FTS/IDX 命中的 8/10
+    质疑系统讨论）重排到结果末尾，导致 embedding/semantic 搜索返回
+    无关内容。短查询保留原排序（FTS rank / 密度分），长查询仍重排。"""
+    if len(query.strip()) <= 6:
+        return candidates
     q_fp = _l3_simhash(query)
     if q_fp == -1:
         return candidates
