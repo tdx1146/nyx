@@ -57,7 +57,8 @@ _commit_pending = 0
 def _get_conn():
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(_SHADOW_DB, check_same_thread=False)
+        _conn = sqlite3.connect(_SHADOW_DB, check_same_thread=False, timeout=15.0)
+        _conn.execute("PRAGMA busy_timeout=15000")
         _conn.executescript(_SCHEMA)
         _conn.commit()
     return _conn
@@ -217,6 +218,7 @@ def shadow_feedback(line_num: int, helpful: bool) -> dict:
         (new_score, line_num)
     )
     _maybe_commit()
+    _commit_now()  # 失忆根因-2：立即提交释放写锁（长驻进程持未提交写事务会锁死其他写入者）
     return {"line_num": line_num, "old_trust": old_score, "new_trust": new_score}
 
 
@@ -231,3 +233,4 @@ def shadow_retrieval_bump(line_nums: list) -> None:
         line_nums
     )
     _maybe_commit()
+    _commit_now()  # 失忆根因-2：立即提交释放写锁（否则长驻进程检索链路会锁死所有落沙写入）
