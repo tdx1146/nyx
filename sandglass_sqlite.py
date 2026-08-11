@@ -111,6 +111,8 @@ def _parse_entries() -> list:
     - 去重：(ts, sender, text) 完全相同只保留首次出现的行号（txt 有双写历史）
     """
     from sandglass_vault import _SANDGLASS, _parse_line
+    import re as _re
+    _TS_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}")
     entries = []          # (lineno, ts, sender, text)
     seen = set()
     if not os.path.exists(_SANDGLASS):
@@ -118,14 +120,14 @@ def _parse_entries() -> list:
     with open(_SANDGLASS, "r", encoding="utf-8") as f:
         for n, line in enumerate(f, 1):
             ts, sender, text = _parse_line(line)
-            if ts:
+            if ts and _TS_RE.match(ts):
                 key = (ts, sender, text)
                 if key in seen:
                     continue
                 seen.add(key)
                 entries.append([n, ts, sender, text])
             else:
-                # 续行：拼到上一条（若上一条未被去重跳过）
+                # 续行（含被误判为条目的含 ' | ' 续行）：拼到上一条
                 if entries and line.strip():
                     entries[-1][3] += "\n" + line.strip()
     return entries
